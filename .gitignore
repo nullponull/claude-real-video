@@ -9,3 +9,4 @@ crv-out/
 *.wav
 *.jpg
 !docs/*.jpg
+.gstack/

@@ -24,11 +24,12 @@ class Result:
     duration: int
     frames_dir: str
     frame_count: int
-    scene_frames: int
+    extracted_frames: int
     transcript_path: str | None
     manifest_path: str
     transcript_note: str = ""
     audio_path: str | None = None
+    report_path: str | None = None
 
 
 def fetch_video(src: str, out_dir: str, cookies: str | None = None) -> str:
@@ -73,57 +74,134 @@ def _has_audio(video: str) -> bool:
     return bool(r.stdout.strip())
 
 
-def extract_frames(video: str, frames_dir: str, scene: float, fps_floor: float,
-                   max_frames: int) -> tuple[int, int]:
-    """Scene-change frames (every visual change) + a density floor (so dynamic
-    videos are never under-sampled). Returns (scene_count, total_before_dedup)."""
+def _fps(video: str) -> float:
+    r = _run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+              "-show_entries", "stream=avg_frame_rate", "-of", "default=nw=1:nk=1", video])
+    try:
+        num, den = r.stdout.strip().split("/")
+        return float(num) / float(den) if float(den) else 25.0
+    except (ValueError, ZeroDivisionError, AttributeError):
+        return 25.0
+
+
+def extract_frames(video: str, frames_dir: str, scene: float, fps_floor: float) -> int:
+    """One chronological pass: every scene change OR one frame per `fps_floor`
+    seconds, whichever comes first. A single select filter keeps the frames in
+    time order, so dedup compares true neighbours (two passes used to interleave
+    scene_/floor_ files out of order). Returns the extracted count."""
     os.makedirs(frames_dir, exist_ok=True)
-    _run(["ffmpeg", "-i", video, "-vf", f"select='gt(scene,{scene})',scale=640:-1",
-          "-vsync", "vfr", os.path.join(frames_dir, "scene_%03d.jpg"),
+    every_n = max(1, round(_fps(video) * fps_floor))
+    _run(["ffmpeg", "-i", video,
+          "-vf", f"select='gt(scene,{scene})+not(mod(n,{every_n}))',scale=640:-1",
+          "-vsync", "vfr", os.path.join(frames_dir, "raw_%05d.jpg"),
           "-hide_banner", "-loglevel", "error"])
-    scene_n = len(glob.glob(os.path.join(frames_dir, "scene_*.jpg")))
-    _run(["ffmpeg", "-i", video, "-vf", f"fps=1/{fps_floor},scale=640:-1",
-          os.path.join(frames_dir, "floor_%03d.jpg"),
-          "-hide_banner", "-loglevel", "error"])
-    total = len(glob.glob(os.path.join(frames_dir, "*.jpg")))
-    if total > max_frames:
-        floors = sorted(glob.glob(os.path.join(frames_dir, "floor_*.jpg")))
-        for i, f in enumerate(floors):
-            if i % 3 != 0:
-                os.remove(f)
-    return scene_n, len(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    return len(glob.glob(os.path.join(frames_dir, "raw_*.jpg")))
 
 
-def dedup_frames(frames_dir: str, threshold: int = 8) -> int:
-    """Drop near-identical consecutive frames via average-hash. This is the key
-    win over fixed-budget extractors: a static slide collapses to one frame."""
+def dedup_frames(frames_dir: str, threshold: float = 8, window: int = 4,
+                 max_frames: int = 150,
+                 dropped_dir: str | None = None) -> tuple[int, list[dict]]:
+    """Drop near-duplicate frames by real pixel difference (downscaled grayscale,
+    like videostil's pixelmatch approach — more faithful than a perceptual hash,
+    which goes blind on flat colours and brightness-only changes) against a
+    sliding window of the last `window` kept frames. The window also catches
+    A-B-A alternation — a shot the model has already seen doesn't come back
+    just because a different frame sat in between. `threshold` is the percent
+    of pixels that must change for a frame to count as new.
+    Returns (kept_count, per-frame records for the optional report)."""
+    frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
     try:
         from PIL import Image
     except ImportError:
-        return len(glob.glob(os.path.join(frames_dir, "*.jpg")))
+        return len(frames), []
 
-    def ahash(path: str, size: int = 12) -> list[int]:
-        im = Image.open(path).convert("L").resize((size, size))
-        px = list(im.getdata())
-        avg = sum(px) / len(px)
-        return [1 if v > avg else 0 for v in px]
+    def sig(path: str, size: int = 16) -> list[tuple[int, int, int]]:
+        # RGB, not grayscale: hues with equal luma (a red→green cut) must not
+        # look identical to the comparator
+        return list(Image.open(path).convert("RGB").resize((size, size)).getdata())
 
-    frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    def pct_diff(a: list, b: list, tol: int = 25) -> float:
+        changed = sum(max(abs(x[0] - y[0]), abs(x[1] - y[1]), abs(x[2] - y[2])) > tol
+                      for x, y in zip(a, b))
+        return 100.0 * changed / len(a)
+
     kept: list[str] = []
-    last: list[int] | None = None
+    recent: list[list[int]] = []  # signatures of the last `window` kept frames
+    records: list[dict] = []
     for f in frames:
-        h = ahash(f)
-        if last is None or sum(a != b for a, b in zip(h, last)) > threshold:
+        h = sig(f)
+        dist = min((pct_diff(h, k) for k in recent), default=None)
+        if dist is None or dist > threshold:
             kept.append(f)
-            last = h
+            recent.append(h)
+            if len(recent) > window:
+                recent.pop(0)
+            records.append({"name": os.path.basename(f), "dist": dist, "kept": True})
         else:
-            os.remove(f)
+            if dropped_dir:
+                os.makedirs(dropped_dir, exist_ok=True)
+                shutil.move(f, os.path.join(dropped_dir, os.path.basename(f)))
+            else:
+                os.remove(f)
+            records.append({"name": os.path.basename(f), "dist": dist, "kept": False})
+
+    # cap: thin uniformly *after* dedup so the survivors stay spread across the video
+    if len(kept) > max_frames:
+        step = len(kept) / max_frames
+        keep_idx = {int(i * step) for i in range(max_frames)}
+        for i, f in enumerate(list(kept)):
+            if i not in keep_idx:
+                kept.remove(f)
+                os.remove(f)
+                for rec in records:
+                    if rec["name"] == os.path.basename(f):
+                        rec["kept"] = False
+                        rec["capped"] = True
+
+    renames = {}
     for i, f in enumerate(sorted(kept), 1):
+        renames[os.path.basename(f)] = f"frame_{i:03d}.jpg"
         os.rename(f, os.path.join(frames_dir, f"tmp_{i:03d}.jpg"))
     for f in sorted(os.listdir(frames_dir)):
         if f.startswith("tmp_"):
             os.rename(os.path.join(frames_dir, f), os.path.join(frames_dir, "frame_" + f[4:]))
-    return len(kept)
+    for rec in records:
+        if rec["kept"]:
+            rec["name"] = renames.get(rec["name"], rec["name"])
+    return len(kept), records
+
+
+def write_report(out_dir: str, records: list[dict], threshold: float, window: int) -> str:
+    """Self-contained report.html showing every extracted frame — kept or
+    dropped — with its hash distance, so you can eyeball whether the threshold
+    is too tight or too loose (videostil's Analysis Viewer, minus the server)."""
+    kept_n = sum(1 for r in records if r["kept"])
+    rows = []
+    for r in records:
+        src = f"frames/{r['name']}" if r["kept"] else f"dropped/{r['name']}"
+        why = "capped" if r.get("capped") else ("kept" if r["kept"] else "dropped")
+        dist = "first" if r["dist"] is None else f"{r['dist']:.1f}%"
+        rows.append(
+            f'<figure class="{why}"><img src="{src}" loading="lazy">'
+            f'<figcaption>{r["name"]}<br>dist {dist} · {why}</figcaption></figure>')
+    html = f"""<!doctype html><meta charset="utf-8"><title>crv dedup report</title>
+<style>
+body{{font:14px system-ui;margin:20px;background:#111;color:#ddd}}
+.grid{{display:flex;flex-wrap:wrap;gap:10px}}
+figure{{margin:0;width:200px}}img{{width:100%;border-radius:4px}}
+figcaption{{font-size:11px;color:#999;padding:2px 0}}
+.dropped img{{opacity:.35;outline:2px solid #a33}}
+.capped img{{opacity:.35;outline:2px solid #a80}}
+.kept img{{outline:2px solid #3a6}}
+</style>
+<h2>crv dedup report</h2>
+<p>threshold {threshold} · window {window} · kept {kept_n} / {len(records)}
+(green kept · red duplicate · orange removed by --max-frames cap)</p>
+<div class="grid">{''.join(rows)}</div>
+"""
+    path = os.path.join(out_dir, "report.html")
+    open(path, "w", encoding="utf-8").write(html)
+    return path
 
 
 def _has_subtitle_stream(video: str) -> bool:
@@ -224,14 +302,16 @@ def transcribe(video: str, out_dir: str, lang: str | None) -> str | None:
 
 def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1.0,
             max_frames: int = 150, lang: str | None = "auto", cookies: str | None = None,
-            do_transcribe: bool = True, dedup_threshold: int = 8,
-            keep_audio: bool = False) -> Result:
+            do_transcribe: bool = True, dedup_threshold: float = 8, dedup_window: int = 4,
+            keep_audio: bool = False, report: bool = False) -> Result:
     os.makedirs(out_dir, exist_ok=True)
     frames_dir = os.path.join(out_dir, "frames")
     video = fetch_video(src, out_dir, cookies=cookies)
     dur = _duration(video)
-    scene_n, _ = extract_frames(video, frames_dir, scene, fps_floor, max_frames)
-    kept = dedup_frames(frames_dir, dedup_threshold)
+    extracted = extract_frames(video, frames_dir, scene, fps_floor)
+    kept, records = dedup_frames(frames_dir, dedup_threshold, dedup_window, max_frames,
+                                 dropped_dir=os.path.join(out_dir, "dropped") if report else None)
+    report_path = write_report(out_dir, records, dedup_threshold, dedup_window) if report else None
 
     # Text for the LLM: prefer subtitles the video already has (faster + more
     # accurate); only fall back to Whisper when there are none. Be honest about
@@ -256,7 +336,8 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
     manifest = os.path.join(out_dir, "MANIFEST.txt")
     lines = [
         f"source: {src}",
-        f"duration: {dur}s | frames: {kept} (scene {scene_n} + density floor, deduped)",
+        f"duration: {dur}s | frames: {kept} (scene-change + density floor, "
+        f"deduped from {extracted} extracted)",
         f"frames dir: {frames_dir}",
         f"transcript: {note}",
     ]
@@ -268,6 +349,6 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
     open(manifest, "w", encoding="utf-8").write("\n".join(lines) + "\n")
 
     return Result(out_dir=out_dir, video=video, duration=dur, frames_dir=frames_dir,
-                  frame_count=kept, scene_frames=scene_n,
+                  frame_count=kept, extracted_frames=extracted,
                   transcript_path=transcript, manifest_path=manifest,
-                  transcript_note=note, audio_path=audio_path)
+                  transcript_note=note, audio_path=audio_path, report_path=report_path)

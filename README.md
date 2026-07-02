@@ -30,6 +30,7 @@ screencast and under-samples a fast-cut reel. `claude-real-video` is smarter:
 | | fixed-interval sampling | **claude-real-video** |
 |---|---|---|
 | Frame selection | every N seconds | **scene-change detection** + density floor |
+| Repeated shots (A-B-A cuts) | sent again every time | **sliding-window dedup** sends each shot once |
 | Static slide (10 min) | ~600 near-identical frames | **collapses to 1** (dedup) |
 | Fast-cut reel | misses frames between samples | catches each visual change |
 | Audio | often ignored | Whisper transcript w/ language detect |
@@ -99,7 +100,9 @@ crv "https://..." --cookies cookies.txt
 | `--fps-floor` | `1.0` | at least one frame every N seconds |
 | `--max-frames` | `150` | hard cap on total frames |
 | `--lang` | `auto` | Whisper language (`en`, `zh`, `auto`, ...) |
-| `--dedup-threshold` | `8` | higher = fewer frames kept |
+| `--dedup-threshold` | `8` | % of pixels that must change for a frame to count as new; higher = fewer frames |
+| `--dedup-window` | `4` | compare against the last N kept frames — a shot the model already saw doesn't come back after a cutaway (`1` = consecutive-only) |
+| `--report` | off | keep dropped frames in `./dropped` + write `report.html` visualising every keep/drop decision |
 | `--no-transcribe` | off | skip audio |
 | `--keep-audio` | off | also save the **full soundtrack** (`audio.m4a`) so audio models can *hear* it |
 | `--cookies` | – | Netscape cookie file for login-gated sources |
@@ -120,18 +123,23 @@ print(r.frame_count, r.transcript_path)
 ## How it works
 
 1. **Fetch** — `yt-dlp` for URLs (optional cookies), or copy a local file.
-2. **Scene frames** — `ffmpeg select='gt(scene,…)'` grabs each visual change.
-3. **Density floor** — also samples every `--fps-floor` seconds so nothing slips through.
-4. **Dedup** — average-hash drops near-identical frames (a static screen → one frame).
-5. **Text** — if the video **already has subtitles** (a sidecar `.srt`/`.vtt` next to a
+2. **Extract** — one chronological `ffmpeg select` pass grabs every scene change
+   *plus* a density floor (at least one frame every `--fps-floor` seconds), so
+   fast cuts and slow screencasts are both covered.
+3. **Dedup** — real pixel difference (downscaled RGB, not a perceptual hash — hashes
+   go blind on flat colours and equal-luma hue changes) against a **sliding window**
+   of the last `--dedup-window` kept frames, so an A-B-A cutaway doesn't re-send a
+   shot the model has already seen. `--report` writes `report.html` showing every
+   keep/drop decision with its diff %, for tuning.
+4. **Text** — if the video **already has subtitles** (a sidecar `.srt`/`.vtt` next to a
    local file, or an embedded subtitle track), those are used as the transcript —
    faster and more accurate than re-transcribing. Only when there are no subtitles
    does it fall back to **Whisper** on the audio (skipped cleanly if there's no audio).
-6. **Audio** *(optional, `--keep-audio`)* — save the **full original soundtrack**
+5. **Audio** *(optional, `--keep-audio`)* — save the **full original soundtrack**
    (`audio.m4a`: music + speech + effects, copied losslessly when possible). The
    transcript only has the *words*; the audio file lets a model that can listen
    (Gemini, GPT-4o, …) actually *hear* the music and tone.
-7. **Manifest** — `MANIFEST.txt` summarises everything for the model.
+6. **Manifest** — `MANIFEST.txt` summarises everything for the model.
 
 So the model can **see** (key frames), **read** (transcript) and — with `--keep-audio` —
 **hear** (full soundtrack) the video. The transcript is plain text any model can read;

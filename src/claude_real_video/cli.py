@@ -22,8 +22,16 @@ def main() -> None:
     ap.add_argument("--cookies", default=None,
                     help="Netscape cookie file for sites that need login (your own, authorised use only)")
     ap.add_argument("--no-transcribe", action="store_true", help="Skip audio transcription")
-    ap.add_argument("--dedup-threshold", type=int, default=8,
-                    help="Frame dedup sensitivity, higher = fewer frames kept (default: 8)")
+    ap.add_argument("--dedup-threshold", type=float, default=8,
+                    help="Percent of pixels that must change for a frame to count as new; "
+                         "higher = fewer frames kept (default: 8)")
+    ap.add_argument("--dedup-window", type=int, default=4,
+                    help="Compare each frame against the last N kept frames, so a shot "
+                         "the model already saw doesn't come back after a cutaway "
+                         "(1 = classic consecutive-only, default: 4)")
+    ap.add_argument("--report", action="store_true",
+                    help="Keep dropped frames in ./dropped and write report.html "
+                         "visualising every keep/drop decision, for tuning the threshold")
     ap.add_argument("--keep-audio", action="store_true",
                     help="Also save the full original soundtrack (music + speech) as audio.m4a, "
                          "for models that can listen to audio (Gemini, GPT-4o, ...)")
@@ -35,15 +43,17 @@ def main() -> None:
             scene=args.scene, fps_floor=args.fps_floor, max_frames=args.max_frames,
             lang=args.lang, cookies=args.cookies,
             do_transcribe=not args.no_transcribe, dedup_threshold=args.dedup_threshold,
-            keep_audio=args.keep_audio,
+            dedup_window=args.dedup_window, keep_audio=args.keep_audio, report=args.report,
         )
     except Exception as e:  # noqa: BLE001 — surface a clean message to the user
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
     print(f"\n✓ Done → {r.out_dir}")
-    print(f"  {r.frame_count} frames  (scene {r.scene_frames} + floor, deduped)  in {r.frames_dir}")
+    print(f"  {r.frame_count} frames  (deduped from {r.extracted_frames} extracted)  in {r.frames_dir}")
     print(f"  manifest:   {r.manifest_path}")
+    if r.report_path:
+        print(f"  report:     {r.report_path}  (open in a browser to tune the threshold)")
     if r.transcript_path:
         print(f"  transcript: {r.transcript_path}")
     else:
