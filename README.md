@@ -19,6 +19,15 @@ crv "https://www.youtube.com/watch?v=..."
 
 Then drop the frames + `MANIFEST.txt` into Claude / ChatGPT / Gemini and ask away.
 
+**New in 0.3.0** — tell it *why* you're watching, and keep what it finds:
+
+```bash
+crv "https://youtu.be/..." --why "find the pricing strategy" --kb ~/notes
+```
+
+`--why` makes the analysis focus on what you care about instead of a generic summary;
+`--kb` saves the result as a dated note in your own notes folder, so it doesn't die in `crv-out`.
+
 ---
 
 ## Why not just sample frames?
