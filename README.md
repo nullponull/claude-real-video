@@ -191,7 +191,7 @@ not something needed to make a video AI-readable.
 
 ## crv Pro — understand *how* a video was shot
 
-**The free version tells your AI what's on screen. crv Pro tells it how it was shot** — camera moves, editing rhythm, action bursts.
+**The free version tells your AI what's on screen. crv Pro tells it how it was shot — and why it works.** Camera moves, editing rhythm, action bursts, plus a one-flag `--breakdown` report: hook analysis, pacing curve, camera language, Reels-algorithm lens, and a rubric your own LLM completes into a full video teardown.
 
 This free tool tells an LLM **what** is on screen. A stack of keyframes can't tell it **how** the video moves — the camera work and the pacing.
 
