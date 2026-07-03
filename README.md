@@ -1,8 +1,12 @@
 # claude-real-video
 
+[![PyPI](https://img.shields.io/pypi/v/claude-real-video)](https://pypi.org/project/claude-real-video/) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://pypi.org/project/claude-real-video/) [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![HN front page](https://img.shields.io/badge/Hacker%20News-front%20page-orange)](https://news.ycombinator.com/item?id=48766005)
+
 **Let Claude — or any LLM — actually watch a video.**
 
 ![demo](docs/demo.gif)
+
+> Same 58-second clip: fixed 1 fps sampling = **58 frames**. crv keeps the **26 that actually differ** — and `--grid` packs them into **3 contact sheets**. Fewer tokens, nothing missed.
 
 Most AI tools don't really *see* a video. Paste a YouTube link into ChatGPT and it
 reads the **transcript**, not the picture. Claude won't take a video file at all.
@@ -134,6 +138,12 @@ crv "https://..." --cookies cookies.txt
 
 ---
 
+### What `--grid` output looks like
+
+One contact sheet = nine consecutive keyframes, in order, filenames on each cell — the model reads a sequence, not scattered stills:
+
+![contact sheet example](docs/grid_example.jpg)
+
 ## Use it from Python
 
 ```python
@@ -181,11 +191,13 @@ not something needed to make a video AI-readable.
 
 ## crv Pro — understand *how* a video was shot
 
+**The free version tells your AI what's on screen. crv Pro tells it how it was shot** — camera moves, editing rhythm, action bursts.
+
 This free tool tells an LLM **what** is on screen. A stack of keyframes can't tell it **how** the video moves — the camera work and the pacing.
 
 **crv Pro** adds a `--motion` pass on top of everything here:
 
-- **Camera-move classification** — every shot labelled static / pan / tilt / zoom / handheld (optical-flow, verified against ground truth)
+- **Camera-move classification** — every shot labelled static / pan / tilt / zoom / handheld (verified against ground-truth footage)
 - **Editing rhythm** — shot list, cuts per minute, and how pacing shifts across the video
 - **Action bursts** — high-motion shots get 0.2s-apart frame sequences so the model reads movement, not guesses
 
