@@ -11,7 +11,7 @@ The user gives you a video (URL or file path) and asks what's in it, to summariz
 
 ## Requirements
 
-- `pip install claude-real-video` (installs the `crv` CLI; needs Python 3.10+ and ffmpeg)
+- `pip install "git+https://github.com/nullponull/claude-real-video"` (installs the `crv` CLI; needs Python 3.10+ and ffmpeg + ffprobe). This timeline fork keeps frame/speech timestamps; the plain `pip install claude-real-video` (upstream) does not.
 - First transcription downloads an openai-whisper base model (~139 MB) automatically
 
 ## Steps
@@ -24,7 +24,7 @@ The user gives you a video (URL or file path) and asks what's in it, to summariz
 
    For long videos cap the frames: `--max-frames 60`.
 
-2. Read `crv-out/MANIFEST.txt` first — it lists every frame with timestamps and includes the transcript.
+2. Read `crv-out/MANIFEST.txt` first. Its `--- timeline ---` section merges every kept frame and every spoken cue on one timestamp axis (`[MM:SS] frame …` / `[MM:SS] speech …`), so you can see which words go with which visual change; the full `[MM:SS]` transcript follows.
 
 3. Read the contact sheets in `crv-out/grids/` (each is a 3×3 sequence of consecutive keyframes, in chronological order). Only read individual `crv-out/frames/*.jpg` when you need a close-up of one moment.
 

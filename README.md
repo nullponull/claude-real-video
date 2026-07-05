@@ -1,14 +1,15 @@
-# claude-real-video
+# claude-real-video (timeline fork)
 
-[![PyPI](https://img.shields.io/pypi/v/claude-real-video)](https://pypi.org/project/claude-real-video/) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://pypi.org/project/claude-real-video/) [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![HN front page](https://img.shields.io/badge/Hacker%20News-front%20page-orange)](https://news.ycombinator.com/item?id=48766005)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/) [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **Let Claude — or any LLM — actually watch a video.**
+
+> **This is a fork of [HUANGCHIHHUNGLeo/claude-real-video](https://github.com/HUANGCHIHHUNGLeo/claude-real-video) by LeoAido (MIT).**
+> The upstream tool extracted scene-aware frames and a transcript, but the two lists shared no time axis: frames were named `frame_001.jpg…` (sequence only) and the transcript had its timecodes stripped — so an LLM couldn't tell *which words were spoken at which visual change*. Upstream's own skill file already promised "every frame with timestamps"; this fork actually delivers it. See [**What this fork adds**](#what-this-fork-adds-060) below.
 
 ![demo](docs/demo.gif)
 
 > Same 58-second clip: fixed 1 fps sampling = **58 frames**. crv keeps the **26 that actually differ** — and `--grid` packs them into **3 contact sheets**. Fewer tokens, nothing missed.
-
-> **This free version lets your AI *see* the video.** [crv Pro](https://leoaido.com/crv-pro/) lets it *understand* it — how it was shot (cut rhythm, camera moves) plus a timestamped timeline of what frames can't show: gestures, expressions, voice pitch shifts, emotion, sound events. One-time founder price.
 
 Most AI tools don't really *see* a video. Paste a YouTube link into ChatGPT and it
 reads the **transcript**, not the picture. Claude won't take a video file at all.
@@ -27,13 +28,44 @@ crv "https://www.youtube.com/watch?v=..."
 
 Then drop the frames + `MANIFEST.txt` into Claude / ChatGPT / Gemini and ask away.
 
+## What this fork adds (0.6.0)
+
+The upstream tool gave the model an ordered pile of frames and a separate wall of
+text with no shared clock. This fork puts **frames and speech on one time axis** so
+"what was said when this changed" is answerable:
+
+- **Real per-frame timestamps** — the extractor reads each kept frame's actual
+  position from ffmpeg's `showinfo` (`pts_time`), instead of relying on filename
+  order. Frames still sort chronologically, but now every one knows *when* it is.
+- **Timestamped transcript** — subtitle/Whisper timecodes are **kept**, not
+  discarded. `transcript.txt` becomes `[MM:SS] line` (Whisper is asked for `.srt`,
+  not `.txt`).
+- **A unified timeline in `MANIFEST.txt`** — every kept frame and every spoken cue
+  merged and sorted by timestamp, so a visual change sits right next to the words
+  around it:
+
+  ```
+  --- timeline (video changes <-> speech, by timestamp) ---
+  [00:00] frame  frame_001.jpg
+  [00:00] speech Red scene: the introduction begins here.
+  [00:03] speech Green scene: now we move to the second topic.
+  [00:03] frame  frame_002.jpg
+  ```
+
+- **Timestamps on `--grid` cells and `--report` captions** too, so the model can
+  cite a moment straight off the contact sheet.
+
+Everything else (scene-aware selection, sliding-window dedup, `--why`, `--kb`,
+`--keep-audio`) is unchanged from upstream. Fully backward compatible — same CLI,
+same output files, just now time-aligned.
+
 Not doing LLM work? It also works as a **general-purpose video keyframe extractor** —
 scene-change detection + dedup, no ML models to download.
 
 **Using Claude Code?** Install it as a skill so Claude watches videos on its own:
 
 ```bash
-pip install claude-real-video
+pip install "git+https://github.com/nullponull/claude-real-video"
 mkdir -p ~/.claude/skills && cp -r skills/claude-real-video ~/.claude/skills/
 ```
 
@@ -74,9 +106,13 @@ understanding.
 ## Install
 
 ```bash
-pip install claude-real-video              # core (frames + dedup)
-pip install "claude-real-video[whisper]"   # + audio transcription
+# this fork (adds the timestamped timeline) — install straight from GitHub:
+pip install "git+https://github.com/nullponull/claude-real-video"                # core (frames + dedup)
+pip install "claude-real-video[whisper] @ git+https://github.com/nullponull/claude-real-video"  # + audio transcription
 ```
+
+> The name on PyPI (`pip install claude-real-video`) is **upstream**, which does
+> **not** have the timeline changes — install from this repo to get them.
 
 ### System requirement: ffmpeg
 
@@ -172,11 +208,15 @@ print(r.frame_count, r.transcript_path)
    local file, or an embedded subtitle track), those are used as the transcript —
    faster and more accurate than re-transcribing. Only when there are no subtitles
    does it fall back to **Whisper** on the audio (skipped cleanly if there's no audio).
+   Either way the **start timecodes are kept** (`transcript.txt` is `[MM:SS] line`),
+   so the words can be placed on the timeline.
 5. **Audio** *(optional, `--keep-audio`)* — save the **full original soundtrack**
    (`audio.m4a`: music + speech + effects, copied losslessly when possible). The
    transcript only has the *words*; the audio file lets a model that can listen
    (Gemini, GPT-4o, …) actually *hear* the music and tone.
-6. **Manifest** — `MANIFEST.txt` summarises everything for the model.
+6. **Manifest** — `MANIFEST.txt` summarises everything for the model, including a
+   **unified timeline** that merges the kept frames and the spoken cues on one
+   timestamp axis (this fork), so each visual change sits next to the words around it.
 
 So the model can **see** (key frames), **read** (transcript) and — with `--keep-audio` —
 **hear** (full soundtrack) the video. The transcript is plain text any model can read;
@@ -191,22 +231,17 @@ not something needed to make a video AI-readable.
   your own, authorised access — don't ship credentials in a repo.
 - Re-running overwrites the output directory.
 
-## crv Pro — understand *how* a video was shot
+## Credits
 
-**The free version tells your AI what's on screen. crv Pro tells it how it was shot — and why it works.** Camera moves, editing rhythm, action bursts, plus a one-flag `--breakdown` report: hook analysis, pacing curve, camera language, Reels-algorithm lens, and a rubric your own LLM completes into a full video teardown.
-
-This free tool tells an LLM **what** is on screen. A stack of keyframes can't tell it **how** the video moves — the camera work and the pacing.
-
-**crv Pro** adds everything the free version can't hear or feel:
-
-- **Camera-move classification** — every shot labelled static / pan / tilt / zoom / handheld (verified against ground-truth footage)
-- **Editing rhythm** — shot list, cuts per minute, and how pacing shifts across the video
-- **Perception timeline** — the subtle things frames can't show: gestures and expressions (a smile, a hand raised, pointing), voice pitch rises and pauses, speaker emotion, and non-speech sound events — all timestamped
-- **A breakdown report** — hook analysis, pacing curve, camera language, and a rubric your own LLM completes into a full teardown
-- **Three modes** — `--mode watch` (understand the content), `--mode creator` (reverse-engineer the making), `--mode full`
-
-All as plain text in the same manifest, still 100% local. One-time founder price $19 → **https://leoaido.com/crv-pro/**
+- Original **claude-real-video** by **LeoAido** — <https://github.com/HUANGCHIHHUNGLeo/claude-real-video>.
+  All of the scene-aware extraction, dedup, and manifest design is theirs; the
+  upstream author also sells a **crv Pro** with richer analysis (camera moves,
+  editing rhythm, a perception timeline of gestures/emotion/sound) — see the
+  upstream repo / <https://leoaido.com/crv-pro/>.
+- This fork adds the **frames↔speech timestamped timeline** described above and is
+  maintained by **nullponull**.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 LeoAido; fork modifications
+(c) 2026 nullponull. The original copyright notice is retained as required.

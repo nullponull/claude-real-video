@@ -30,6 +30,7 @@ class Result:
     transcript_note: str = ""
     audio_path: str | None = None
     report_path: str | None = None
+    frame_times: dict = field(default_factory=dict)
 
 
 def fetch_video(src: str, out_dir: str, cookies: str | None = None, cookies_from_browser: str | None = None) -> str:
@@ -86,23 +87,62 @@ def _fps(video: str) -> float:
         return 25.0
 
 
-def extract_frames(video: str, frames_dir: str, scene: float, fps_floor: float) -> int:
+def _fmt_ts(t: float | None) -> str:
+    """Seconds -> MM:SS (or H:MM:SS past an hour). None -> --:-- so a frame whose
+    timestamp we couldn't recover still lines up in the manifest columns."""
+    if t is None:
+        return "--:--"
+    t = int(round(t))
+    h, rem = divmod(t, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _parse_ts(ts: str) -> float:
+    """An srt/vtt timecode ('00:01:02,500' or '01:02.5') -> seconds."""
+    ts = ts.strip().replace(",", ".")
+    parts = ts.split(":")
+    try:
+        if len(parts) == 3:
+            h, m, s = parts
+        elif len(parts) == 2:
+            h, m, s = "0", parts[0], parts[1]
+        else:
+            h, m, s = "0", "0", parts[0]
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    except ValueError:
+        return 0.0
+
+
+def extract_frames(video: str, frames_dir: str, scene: float, fps_floor: float) -> dict[str, float | None]:
     """One chronological pass: every scene change OR one frame per `fps_floor`
     seconds, whichever comes first. A single select filter keeps the frames in
     time order, so dedup compares true neighbours (two passes used to interleave
-    scene_/floor_ files out of order). Returns the extracted count."""
+    scene_/floor_ files out of order).
+
+    The `showinfo` filter prints one `pts_time:` line per frame that survives the
+    select, in output order — so its Nth value is raw_0000N.jpg's real position
+    in the video. That is what lets the manifest say *when* each kept frame is,
+    and align a visual change with the words spoken at that moment. Returns a
+    {raw_filename: timestamp_seconds} map (timestamp None if a build without
+    showinfo left the counts out of step — we degrade rather than mis-align)."""
     os.makedirs(frames_dir, exist_ok=True)
     every_n = max(1, round(_fps(video) * fps_floor))
-    _run(["ffmpeg", "-i", video,
-          "-vf", f"select='gt(scene,{scene})+not(mod(n,{every_n}))',scale=640:-1",
-          "-vsync", "vfr", os.path.join(frames_dir, "raw_%05d.jpg"),
-          "-hide_banner", "-loglevel", "error"])
-    return len(glob.glob(os.path.join(frames_dir, "raw_*.jpg")))
+    r = _run(["ffmpeg", "-i", video,
+              "-vf", f"select='gt(scene,{scene})+not(mod(n,{every_n}))',showinfo,scale=640:-1",
+              "-vsync", "vfr", os.path.join(frames_dir, "raw_%05d.jpg"),
+              "-hide_banner", "-loglevel", "info"])
+    times = [float(m) for m in re.findall(r"pts_time:([0-9.]+)", r.stderr)]
+    raws = sorted(glob.glob(os.path.join(frames_dir, "raw_*.jpg")))
+    if len(times) == len(raws):
+        return {os.path.basename(f): t for f, t in zip(raws, times)}
+    return {os.path.basename(f): None for f in raws}
 
 
 def dedup_frames(frames_dir: str, threshold: float = 8, window: int = 4,
                  max_frames: int = 150,
-                 dropped_dir: str | None = None) -> tuple[int, list[dict]]:
+                 dropped_dir: str | None = None,
+                 times: dict[str, float | None] | None = None) -> tuple[int, list[dict], dict[str, float | None]]:
     """Drop near-duplicate frames by real pixel difference (downscaled grayscale,
     like videostil's pixelmatch approach — more faithful than a perceptual hash,
     which goes blind on flat colours and brightness-only changes) against a
@@ -110,12 +150,15 @@ def dedup_frames(frames_dir: str, threshold: float = 8, window: int = 4,
     A-B-A alternation — a shot the model has already seen doesn't come back
     just because a different frame sat in between. `threshold` is the percent
     of pixels that must change for a frame to count as new.
-    Returns (kept_count, per-frame records for the optional report)."""
+    `times` maps each raw frame to its video timestamp; it rides through the
+    dedup + rename so callers get {frame_NNN.jpg: seconds}.
+    Returns (kept_count, per-frame records for the optional report, kept_times)."""
+    times = times or {}
     frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
     try:
         from PIL import Image
     except ImportError:
-        return len(frames), []
+        return len(frames), [], {os.path.basename(f): times.get(os.path.basename(f)) for f in frames}
 
     def sig(path: str, size: int = 16) -> list[tuple[int, int, int]]:
         # RGB, not grayscale: hues with equal luma (a red→green cut) must not
@@ -138,14 +181,16 @@ def dedup_frames(frames_dir: str, threshold: float = 8, window: int = 4,
             recent.append(h)
             if len(recent) > window:
                 recent.pop(0)
-            records.append({"name": os.path.basename(f), "dist": dist, "kept": True})
+            records.append({"name": os.path.basename(f), "dist": dist, "kept": True,
+                            "t": times.get(os.path.basename(f))})
         else:
             if dropped_dir:
                 os.makedirs(dropped_dir, exist_ok=True)
                 shutil.move(f, os.path.join(dropped_dir, os.path.basename(f)))
             else:
                 os.remove(f)
-            records.append({"name": os.path.basename(f), "dist": dist, "kept": False})
+            records.append({"name": os.path.basename(f), "dist": dist, "kept": False,
+                            "t": times.get(os.path.basename(f))})
 
     # cap: thin uniformly *after* dedup so the survivors stay spread across the video
     if len(kept) > max_frames:
@@ -170,7 +215,9 @@ def dedup_frames(frames_dir: str, threshold: float = 8, window: int = 4,
     for rec in records:
         if rec["kept"]:
             rec["name"] = renames.get(rec["name"], rec["name"])
-    return len(kept), records
+    kept_times = {frame_name: times.get(raw_name)
+                  for raw_name, frame_name in renames.items()}
+    return len(kept), records, kept_times
 
 
 def write_report(out_dir: str, records: list[dict], threshold: float, window: int) -> str:
@@ -183,9 +230,10 @@ def write_report(out_dir: str, records: list[dict], threshold: float, window: in
         src = f"frames/{r['name']}" if r["kept"] else f"dropped/{r['name']}"
         why = "capped" if r.get("capped") else ("kept" if r["kept"] else "dropped")
         dist = "first" if r["dist"] is None else f"{r['dist']:.1f}%"
+        ts = _fmt_ts(r.get("t"))
         rows.append(
             f'<figure class="{why}"><img src="{src}" loading="lazy">'
-            f'<figcaption>{r["name"]}<br>dist {dist} · {why}</figcaption></figure>')
+            f'<figcaption>{r["name"]} · {ts}<br>dist {dist} · {why}</figcaption></figure>')
     html = f"""<!doctype html><meta charset="utf-8"><title>crv dedup report</title>
 <style>
 body{{font:14px system-ui;margin:20px;background:#111;color:#ddd}}
@@ -212,32 +260,52 @@ def _has_subtitle_stream(video: str) -> bool:
     return bool(r.stdout.strip())
 
 
-def _subs_to_text(sub_path: str, out_txt: str) -> str | None:
-    """Convert an .srt/.vtt subtitle file to plain text (drop indices,
-    timecodes and styling tags). Returns out_txt on success."""
+def _subs_to_cues(sub_path: str) -> list[tuple[float, str]]:
+    """Parse an .srt/.vtt subtitle file into [(start_seconds, text), ...],
+    keeping the start timecode of every cue. The old version threw the timecodes
+    away, which is exactly why a spoken line could no longer be tied to the frame
+    it belongs with; here we keep them so the manifest can build a real timeline."""
     try:
         raw = open(sub_path, encoding="utf-8", errors="ignore").read()
     except OSError:
+        return []
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
+    cues: list[tuple[float, str]] = []
+    for block in re.split(r"\n\s*\n", raw):
+        start: float | None = None
+        text: list[str] = []
+        for ln in block.splitlines():
+            s = ln.strip()
+            if not s or s == "WEBVTT" or s.isdigit():
+                continue
+            if "-->" in s:
+                start = _parse_ts(s.split("-->")[0])
+                continue
+            s = re.sub(r"<[^>]+>", "", s)  # strip vtt inline tags like <v ->
+            if s:
+                text.append(s)
+        joined = " ".join(text).strip()
+        if start is not None and joined:
+            cues.append((start, joined))
+    return cues
+
+
+def _write_transcript(cues: list[tuple[float, str]], out_txt: str) -> str | None:
+    """Write cues to transcript.txt as '[MM:SS] text' — human-readable and,
+    unlike the old plain dump, still carrying when each line was spoken."""
+    if not cues:
         return None
-    lines: list[str] = []
-    for ln in raw.splitlines():
-        s = ln.strip().lstrip("﻿").strip()  # drop BOM if present
-        if not s or s.startswith("WEBVTT") or s.isdigit() or "-->" in s:
-            continue
-        s = re.sub(r"<[^>]+>", "", s)  # strip vtt inline tags like <v ->
-        if s:
-            lines.append(s)
-    text = "\n".join(lines).strip()
-    if not text:
-        return None
-    open(out_txt, "w", encoding="utf-8").write(text + "\n")
+    with open(out_txt, "w", encoding="utf-8") as fh:
+        for t, text in cues:
+            fh.write(f"[{_fmt_ts(t)}] {text}\n")
     return out_txt
 
 
-def existing_subtitles(src: str, video: str, out_dir: str) -> str | None:
+def existing_subtitles(src: str, video: str, out_dir: str) -> tuple[str | None, list[tuple[float, str]]]:
     """Use subtitles the video already ships with, instead of re-transcribing.
     Checks (1) a sidecar .srt/.vtt next to a local source file, then
-    (2) an embedded subtitle stream. Returns the transcript path, or None.
+    (2) an embedded subtitle stream. Returns (transcript_path, cues) — cues carry
+    the timecodes so the caller can build a timeline; ("", []) / (None, []) if none.
     This is faster and more accurate than Whisper when captions already exist."""
     dst = os.path.join(out_dir, "transcript.txt")
     # 1) sidecar file next to the original source (local files only)
@@ -245,22 +313,24 @@ def existing_subtitles(src: str, video: str, out_dir: str) -> str | None:
         base = os.path.splitext(src)[0]
         for ext in (".srt", ".vtt"):
             cand = base + ext
-            if os.path.exists(cand) and _subs_to_text(cand, dst):
-                return dst
+            if os.path.exists(cand):
+                cues = _subs_to_cues(cand)
+                if _write_transcript(cues, dst):
+                    return dst, cues
     # 2) embedded subtitle stream
     if _has_subtitle_stream(video):
         raw = os.path.join(out_dir, "_embedded.srt")
         _run(["ffmpeg", "-y", "-i", video, "-map", "0:s:0", raw,
               "-hide_banner", "-loglevel", "error"])
         if os.path.exists(raw):
-            ok = _subs_to_text(raw, dst)
+            cues = _subs_to_cues(raw)
             try:
                 os.remove(raw)
             except OSError:
                 pass
-            if ok:
-                return dst
-    return None
+            if _write_transcript(cues, dst):
+                return dst, cues
+    return None, []
 
 
 def extract_full_audio(video: str, out_dir: str) -> str | None:
@@ -281,33 +351,39 @@ def extract_full_audio(video: str, out_dir: str) -> str | None:
     return dst if os.path.exists(dst) and os.path.getsize(dst) > 0 else None
 
 
-def transcribe(video: str, out_dir: str, lang: str | None, model: str = "base") -> str | None:
-    """Optional: extract audio + run Whisper if the `whisper` CLI is installed."""
+def transcribe(video: str, out_dir: str, lang: str | None, model: str = "base") -> tuple[str | None, list[tuple[float, str]]]:
+    """Optional: extract audio + run Whisper if the `whisper` CLI is installed.
+    Asks Whisper for .srt (timestamped) instead of .txt, so the words keep the
+    times that let them line up with the frames. Returns (transcript_path, cues)."""
     if not _have("whisper"):
-        return None
+        return None, []
     wav = os.path.join(out_dir, "audio.wav")
     _run(["ffmpeg", "-i", video, "-vn", "-ar", "16000", "-ac", "1", wav,
           "-hide_banner", "-loglevel", "error"])
     if not os.path.exists(wav):
-        return None
-    cmd = ["whisper", wav, "--model", model, "--output_format", "txt", "--output_dir", out_dir]
+        return None, []
+    cmd = ["whisper", wav, "--model", model, "--output_format", "srt", "--output_dir", out_dir]
     if lang and lang != "auto":
         cmd += ["--language", lang]
     _run(cmd)
-    src = os.path.join(out_dir, "audio.txt")
+    srt = os.path.join(out_dir, "audio.srt")
     dst = os.path.join(out_dir, "transcript.txt")
-    if os.path.exists(src):
-        os.replace(src, dst)
-        return dst
-    return None
+    if os.path.exists(srt):
+        cues = _subs_to_cues(srt)
+        if _write_transcript(cues, dst):
+            return dst, cues
+    return None, []
 
 
 def make_grids(frames_dir: str, out_dir: str, cols: int = 3, rows: int = 3,
-               cell_width: int = 480) -> list[str]:
+               cell_width: int = 480, times: dict | None = None) -> list[str]:
     """Tile the kept frames, in order, into contact-sheet grids. A model reading
     consecutive frames side by side in one image follows motion and progression
-    far better than the same frames seen one at a time."""
+    far better than the same frames seen one at a time. Each cell is labelled with
+    its timestamp too, so the model can cite when a moment happens straight off
+    the sheet — no cross-referencing the manifest."""
     from PIL import Image, ImageDraw
+    times = times or {}
     frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
     if not frames:
         return []
@@ -328,7 +404,9 @@ def make_grids(frames_dir: str, out_dir: str, cols: int = 3, rows: int = 3,
             im = im.resize((cw, ch - label_h))
             x, y = (i % cols) * cw, (i // cols) * ch
             sheet.paste(im, (x, y + label_h))
-            draw.text((x + 6, y + 4), os.path.basename(f), fill="white")
+            name = os.path.basename(f)
+            label = f"{name}   {_fmt_ts(times.get(name))}" if name in times else name
+            draw.text((x + 6, y + 4), label, fill="white")
         dest = os.path.join(grids_dir, f"grid_{gi // per + 1:02d}.jpg")
         sheet.save(dest, quality=85)
         sheets.append(dest)
@@ -355,26 +433,32 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
     frames_dir = os.path.join(out_dir, "frames")
     video = fetch_video(src, out_dir, cookies=cookies, cookies_from_browser=cookies_from_browser)
     dur = _duration(video)
-    extracted = extract_frames(video, frames_dir, scene, fps_floor)
-    kept, records = dedup_frames(frames_dir, dedup_threshold, dedup_window, max_frames,
-                                 dropped_dir=os.path.join(out_dir, "dropped") if report else None)
+    frame_times = extract_frames(video, frames_dir, scene, fps_floor)
+    extracted = len(frame_times)
+    kept, records, kept_times = dedup_frames(
+        frames_dir, dedup_threshold, dedup_window, max_frames,
+        dropped_dir=os.path.join(out_dir, "dropped") if report else None,
+        times=frame_times)
     report_path = write_report(out_dir, records, dedup_threshold, dedup_window) if report else None
 
     # Text for the LLM: prefer subtitles the video already has (faster + more
     # accurate); only fall back to Whisper when there are none. Be honest about
     # *why* there's no transcript — a silent video is not a missing whisper install.
     transcript = None
+    cues: list[tuple[float, str]] = []
     if not do_transcribe:
         note = "(skipped: --no-transcribe)"
-    elif (transcript := existing_subtitles(src, video, out_dir)):
-        note = f"{transcript} (from the video's own subtitles)"
-    elif not _have("whisper"):
-        note = "(none — no existing subtitles; install whisper to transcribe: pip install openai-whisper)"
-    elif not _has_audio(video):
-        note = "(none — this video has no subtitles and no audio track)"
     else:
-        transcript = transcribe(video, out_dir, lang, model=whisper_model)
-        note = f"{transcript} (transcribed by whisper)" if transcript else "(none — transcription failed)"
+        transcript, cues = existing_subtitles(src, video, out_dir)
+        if transcript:
+            note = f"{transcript} (from the video's own subtitles)"
+        elif not _have("whisper"):
+            note = "(none — no existing subtitles; install whisper to transcribe: pip install openai-whisper)"
+        elif not _has_audio(video):
+            note = "(none — this video has no subtitles and no audio track)"
+        else:
+            transcript, cues = transcribe(video, out_dir, lang, model=whisper_model)
+            note = f"{transcript} (transcribed by whisper)" if transcript else "(none — transcription failed)"
 
     # Optionally keep the full original soundtrack (music + speech + effects) for
     # models that can listen to audio directly — the transcript only has the words.
@@ -397,6 +481,22 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
     ]
     if keep_audio:
         lines.append(f"audio: {audio_path or '(none — this video has no audio track)'}")
+
+    # Unified timeline: every kept frame and every spoken cue on ONE time axis,
+    # so the reader can see which words belong with which visual change. This is
+    # the whole point of the fork — order-only lists left the model to guess the
+    # alignment. Frames sort before speech at an equal timestamp; anything whose
+    # time we couldn't recover sinks to the bottom (still listed, never dropped).
+    events: list[tuple[float | None, int, str]] = []
+    for name, t in kept_times.items():
+        events.append((t, 0, f"frame  {name}"))
+    for t, text in cues:
+        events.append((t, 1, f"speech {text}"))
+    events.sort(key=lambda e: (e[0] is None, e[0] if e[0] is not None else 0.0, e[1]))
+    lines.append("--- timeline (video changes <-> speech, by timestamp) ---")
+    for t, _kind, payload in events:
+        lines.append(f"[{_fmt_ts(t)}] {payload}")
+
     lines.append("--- transcript ---")
     if transcript and os.path.exists(transcript):
         lines.append(open(transcript, encoding="utf-8").read().strip())
@@ -405,4 +505,5 @@ def process(src: str, out_dir: str, *, scene: float = 0.30, fps_floor: float = 1
     return Result(out_dir=out_dir, video=video, duration=dur, frames_dir=frames_dir,
                   frame_count=kept, extracted_frames=extracted,
                   transcript_path=transcript, manifest_path=manifest,
-                  transcript_note=note, audio_path=audio_path, report_path=report_path)
+                  transcript_note=note, audio_path=audio_path, report_path=report_path,
+                  frame_times=kept_times)

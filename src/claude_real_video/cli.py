@@ -82,7 +82,7 @@ def main() -> None:
         print(f"  audio:      {r.audio_path}  (full soundtrack — music + speech)")
     if args.grid:
         from .core import make_grids
-        sheets = make_grids(r.frames_dir, r.out_dir)
+        sheets = make_grids(r.frames_dir, r.out_dir, times=r.frame_times)
         print(f"  grids:      {len(sheets)} contact sheet(s) in {r.out_dir}/grids")
     if args.kb:
         from .core import save_to_kb
